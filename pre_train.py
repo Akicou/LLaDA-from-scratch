@@ -1,73 +1,51 @@
 from model import LLaDAModel, LLaDAModelLM
-from configs_llada import ModelConfig, LayerNormType, BlockType, InitFnType, ActivationType, ActivationCheckpointingStrategy, LLaDAConfig
+from configs_llada import ActivationCheckpointingStrategy
 import torch
 from dataset import LLaDADataset
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers.optimization import get_linear_schedule_with_warmup
-from pathlib import Path
 from transformers import AutoTokenizer
+from training_setup import TrainingSettings, build_hf_config, build_model_config, detect_device
 
 # We will train and iterate from the base with a 100M parameter model to test and then scale to the 1B model.
 # Ok for training we should use ModelConfig not LLaDAConfig
-device = ("cuda:0" if torch.cuda.is_available() else "cpu")
-model_100M = ModelConfig(d_model=768, n_heads=12, n_layers=14, 
-            n_kv_heads=12, mlp_ratio=4, mlp_hidden_size=3072,
-            max_sequence_length=4096, vocab_size=126464,
-            mask_token_id=126336, eos_token_id=126081,
-            pad_token_id=126081, layer_norm_type=LayerNormType.rms,
-            rms_norm_eps=1e-5, attention_dropout=0.0, residual_dropout=0.0,
-            embedding_dropout=0.0, embedding_size=126464, block_type=BlockType.llama,
-            block_group_size=1, attention_layer_norm=False, attention_layer_norm_with_affine=True,
-            rope=True, rope_full_precision=True, rope_theta=500000.0, precision="bf16", weight_tying=False,
-            init_device=device, init_fn=InitFnType.mitchell, init_std=0.02, activation_type=ActivationType.swiglu,
-            alibi=False, alibi_bias_max=8.0)
-
-hf_configs = LLaDAConfig(d_model=768, n_heads=12, n_layers=14, 
-            n_kv_heads=12, mlp_ratio=4, mlp_hidden_size=3072,
-            max_sequence_length=4096, vocab_size=126464,
-            mask_token_id=126336, eos_token_id=126081,
-            pad_token_id=126081, layer_norm_type=LayerNormType.rms,
-            rms_norm_eps=1e-5, attention_dropout=0.0, residual_dropout=0.0,
-            embedding_dropout=0.0, embedding_size=126464, block_type=BlockType.llama,
-            block_group_size=1, attention_layer_norm=False, attention_layer_norm_with_affine=True,
-            rope=True, rope_full_precision=True, rope_theta=500000.0, precision="bf16", weight_tying=False,
-            init_device=device, init_fn=InitFnType.mitchell, init_std=0.02, activation_type=ActivationType.swiglu,
-            alibi=False, alibi_bias_max=8.0)
+device = detect_device()
+settings = TrainingSettings()
+model_100M = build_model_config(device)
+hf_configs = build_hf_config(device)
 
 print("Load model test")
 model = LLaDAModel(model_100M, init_params=True)
 model.set_activation_checkpointing(ActivationCheckpointingStrategy.one_in_two)
-tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained(settings.tokenizer_name)
 hf_model = LLaDAModelLM(config=hf_configs, model=model)
 print("Model test success")
 
-dataset = LLaDADataset(["/teamspace/studios/this_studio/data_train_en/datasets--Fredtt3--LLaDA-Sample-10BT/snapshots/ee6dbc7d4bf1e4b2d0974e48f5fcb8b62b1f27f4",
-"/teamspace/studios/this_studio/data_train_es/datasets--Fredtt3--LLaDA-Sample-ES/snapshots/1f3128a94b4ff7e8d96892052704529e720f6b58"])
+dataset = LLaDADataset(list(settings.dataset_paths))
 dataloader = DataLoader(
     dataset,
-    batch_size=1,
+    batch_size=settings.batch_size,
     shuffle=True,
-    num_workers=0,
-    pin_memory=True
+    num_workers=settings.num_workers,
+    pin_memory=settings.pin_memory
 )
 
 
-optimizer = AdamW(hf_model.parameters(), lr=4e-4, weight_decay=0.1)
+optimizer = AdamW(hf_model.parameters(), lr=settings.learning_rate, weight_decay=settings.weight_decay)
 
-total_steps = 50_000  
-warmup_steps = 2_000
+total_steps = settings.total_steps
+warmup_steps = settings.warmup_steps
 scheduler = get_linear_schedule_with_warmup(
     optimizer,
     num_warmup_steps=warmup_steps,
     num_training_steps=total_steps
 )
 
-log_every  = 100
-save_every = 500
-output_dir = Path("checkpoints")
-output_dir.mkdir(parents=True, exist_ok=True)
+log_every = settings.log_every
+save_every = settings.save_every
+output_dir = settings.checkpoint_path()
 
 for step, batch in enumerate(dataloader, start=1):
     hf_model.train()
